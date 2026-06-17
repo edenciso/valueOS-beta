@@ -1,0 +1,22 @@
+{
+  "events": [
+    {
+      "outcome_id": "out_demo_1",
+      "event_time": "2026-02-01T12:30:00Z",
+      "event_type": "BUSINESS_OUTCOME",
+      "object_ref": {
+        "system": "crm",
+        "type": "opportunity",
+        "id": "opp_123"
+      },
+      "event_name": "pipeline_stage_change",
+      "delta": {
+        "value": 25000,
+        "unit": "USD"
+      },
+      "kpi_tags": [
+        "revenue"
+      ]
+    }
+  ]
+}

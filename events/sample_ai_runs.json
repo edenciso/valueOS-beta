@@ -1,0 +1,31 @@
+{
+  "events": [
+    {
+      "event_id": "01JDEMOAI0001",
+      "event_time": "2026-02-01T12:00:00Z",
+      "source": "agent-sdk",
+      "correlation": {
+        "run_id": "run_demo_1",
+        "workflow_id": "wf_demo_1",
+        "external_object_refs": [
+          {
+            "system": "crm",
+            "type": "opportunity",
+            "id": "opp_123"
+          }
+        ]
+      },
+      "data": {
+        "asset_id": "agent_42",
+        "model": {
+          "provider": "bedrock",
+          "model_id": "claude"
+        },
+        "metrics": {
+          "latency_ms": 1200,
+          "cost_usd": 0.015
+        }
+      }
+    }
+  ]
+}

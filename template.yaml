@@ -1,0 +1,617 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ValueOS - 4-week insights beta (SAM, serverless, multi-tenant M2M + Cognito admin) + Demo Simulation Mode
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+  AppName:
+    Type: String
+    Default: valueos-4w
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20240620-v1:0
+    Description: "Bedrock modelId for Claude. Verify availability & access in your region."
+  TokenTtlSeconds:
+    Type: Number
+    Default: 900
+  DefaultLimRpm:
+    Type: Number
+    Default: 600
+  DefaultLimRpd:
+    Type: Number
+    Default: 50000
+  RawTtlDays:
+    Type: Number
+    Default: 14
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 20
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        APP_NAME: !Ref AppName
+        TENANTS_TABLE: !Ref TenantsTable
+        SERVICE_PRINCIPALS_TABLE: !Ref ServicePrincipalsTable
+        RATE_LIMIT_TABLE: !Ref RateLimitTable
+        RAW_EVENTS_TABLE: !Ref RawEventsTable
+        RUN_INDEX_TABLE: !Ref RunIndexTable
+        ATTRIBUTION_TABLE: !Ref AttributionTable
+        RAW_BUCKET: !Ref RawBucket
+        INSIGHTS_BUCKET: !Ref InsightsBucket
+        EVIDENCE_BUCKET: !Ref EvidenceBucket
+        TS_DB: !Ref TimestreamDatabase
+        TS_TABLE: !Ref TimestreamTable
+        JWT_SECRET_ARN: !Ref JwtSigningSecret
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        TOKEN_TTL_SECONDS: !Ref TokenTtlSeconds
+        DEFAULT_LIM_RPM: !Ref DefaultLimRpm
+        DEFAULT_LIM_RPD: !Ref DefaultLimRpd
+        RAW_TTL_DAYS: !Ref RawTtlDays
+        DEMO_SESSIONS_TABLE: !Ref DemoSessionsTable
+
+Resources:
+  ValueOSApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-api"
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'content-type,authorization,x-api-key'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt AdminUserPool.Arn
+          M2MTokenAuthorizer:
+            FunctionArn: !GetAtt M2MAuthorizerFunction.Arn
+            FunctionPayloadType: TOKEN
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 0
+
+  AdminUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AppName}-${Stage}-admin-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  AdminUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref AdminUserPool
+      ClientName: !Sub "${AppName}-${Stage}-admin-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  JwtSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AppName}/${Stage}/m2m/jwtSigningSecret"
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: "hmac"
+        PasswordLength: 64
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-raw-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: { Status: Suspended }
+
+  InsightsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-insights-${AWS::AccountId}-${AWS::Region}"
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-${Stage}-evidence-${AWS::AccountId}-${AWS::Region}"
+
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-tenants"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+
+  ServicePrincipalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-service-principals"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: client_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: client_id
+          KeyType: HASH
+
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-rate-limit"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  RawEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-raw-events"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  RunIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-run-index"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+
+  AttributionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-attribution"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  DemoSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-${Stage}-demo-sessions"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Sub "${AppName}_${Stage}_metrics"
+
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: portfolio_metrics
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: 168
+        MagneticStoreRetentionPeriodInDays: 365
+
+  DefaultUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${AppName}-${Stage}-default-plan"
+      ApiStages:
+        - ApiId: !Ref ValueOSApi
+          Stage: !Ref Stage
+      Throttle:
+        BurstLimit: 200
+        RateLimit: 100
+      Quota:
+        Limit: 200000
+        Period: DAY
+
+  DefaultApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ValueOSApiStage
+    Properties:
+      Name: !Sub "${AppName}-${Stage}-default-api-key"
+      Enabled: true
+
+  DefaultUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref DefaultApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref DefaultUsagePlan
+
+  M2MAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/m2m_authorizer/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref JwtSigningSecret
+
+  TokenBrokerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/token_broker/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt ServicePrincipalsTable.Arn
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt TenantsTable.Arn
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref JwtSigningSecret
+      Events:
+        Token:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/m2m/token
+            Method: POST
+            Auth:
+              Authorizer: NONE
+              ApiKeyRequired: true
+
+  IngestAiRunsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ingest_ai_runs/
+      Handler: app.handler
+      Timeout: 29
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt RateLimitTable.Arn
+                - !GetAtt RawEventsTable.Arn
+                - !GetAtt RunIndexTable.Arn
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${RawBucket.Arn}/*"
+            - Effect: Allow
+              Action:
+                - timestream:WriteRecords
+                - timestream:DescribeEndpoints
+              Resource: "*"
+      Events:
+        Ingest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/m2m/events/ai-runs
+            Method: POST
+            Auth:
+              Authorizer: M2MTokenAuthorizer
+              ApiKeyRequired: true
+
+  IngestOutcomesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/ingest_outcomes/
+      Handler: app.handler
+      Timeout: 29
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource:
+                - !GetAtt RateLimitTable.Arn
+                - !GetAtt RawEventsTable.Arn
+                - !GetAtt RunIndexTable.Arn
+                - !GetAtt AttributionTable.Arn
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${RawBucket.Arn}/*"
+            - Effect: Allow
+              Action:
+                - timestream:WriteRecords
+                - timestream:DescribeEndpoints
+              Resource: "*"
+      Events:
+        Ingest:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/m2m/events/business-outcomes
+            Method: POST
+            Auth:
+              Authorizer: M2MTokenAuthorizer
+              ApiKeyRequired: true
+
+  AdminCreateServicePrincipalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_create_service_principal/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt TenantsTable.Arn
+                - !GetAtt ServicePrincipalsTable.Arn
+      Events:
+        CreateSp:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/service-principals
+            Method: POST
+
+  AdminQueryPortfolioFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_query_portfolio/
+      Handler: app.handler
+      Timeout: 29
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - timestream:Query
+                - timestream:DescribeEndpoints
+              Resource: "*"
+      Events:
+        Query:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/portfolio
+            Method: GET
+
+  AdminGetLatestInsightsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_get_latest_insights/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${InsightsBucket.Arn}/*"
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/insights/latest
+            Method: GET
+
+  AdminGetLatestEvidenceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_get_latest_evidence/
+      Handler: app.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${EvidenceBucket.Arn}/*"
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/evidence/latest
+            Method: GET
+
+  AdminIntegrationWizardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_integration_wizard/
+      Handler: app.handler
+      Timeout: 29
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+      Events:
+        Wizard:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/integration/wizard
+            Method: POST
+
+  AdminWizardSimulateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/admin_wizard_simulate/
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          FN_INGEST_AI_RUNS: !Ref IngestAiRunsFunction
+          FN_INGEST_OUTCOMES: !Ref IngestOutcomesFunction
+          FN_DAILY_INSIGHTS: !Ref ScheduledDailyInsightsFunction
+          FN_EVIDENCE_PACK: !Ref GenerateEvidencePackFunction
+          DEMO_TTL_HOURS: "72"
+          MAX_SAMPLES: "12"
+          MAX_SAMPLE_BYTES: "50000"
+          MAX_CANONICAL_EVENTS: "120"
+          MAX_BATCH_EVENTS: "40"
+          MAX_BODY_BYTES: "250000"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:GetItem
+              Resource:
+                - !GetAtt TenantsTable.Arn
+                - !GetAtt ServicePrincipalsTable.Arn
+                - !GetAtt DemoSessionsTable.Arn
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt IngestAiRunsFunction.Arn
+                - !GetAtt IngestOutcomesFunction.Arn
+                - !GetAtt ScheduledDailyInsightsFunction.Arn
+                - !GetAtt GenerateEvidencePackFunction.Arn
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+      Events:
+        Simulate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ValueOSApi
+            Path: /v1/admin/integration/wizard/simulate
+            Method: POST
+
+  ScheduledDailyInsightsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/scheduled_daily_insights/
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 1024
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt TenantsTable.Arn
+            - Effect: Allow
+              Action:
+                - timestream:Query
+                - timestream:DescribeEndpoints
+              Resource: "*"
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${InsightsBucket.Arn}/*"
+      Events:
+        Daily9amET:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(0 14 * * ? *)"
+            ScheduleExpressionTimezone: "UTC"
+
+  GenerateEvidencePackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/evidence_pack/
+      Handler: app.handler
+      Timeout: 60
+      MemorySize: 1024
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt TenantsTable.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "${InsightsBucket.Arn}/*"
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${EvidenceBucket.Arn}/*"
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+      Events:
+        DailyEvidence:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "cron(15 14 * * ? *)"
+            ScheduleExpressionTimezone: "UTC"
+
+Outputs:
+  ApiBaseUrl:
+    Value: !Sub "https://${ValueOSApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  AdminUserPoolId:
+    Value: !Ref AdminUserPool
+  AdminUserPoolClientId:
+    Value: !Ref AdminUserPoolClient
+  RawBucketName:
+    Value: !Ref RawBucket
+  InsightsBucketName:
+    Value: !Ref InsightsBucket
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  MetricsDb:
+    Value: !Ref TimestreamDatabase
+  MetricsTable:
+    Value: !Ref TimestreamTable
+  DefaultApiKeyId:
+    Value: !Ref DefaultApiKey
+  DefaultApiKeyValue:
+    Value: !GetAtt DefaultApiKey.Value
