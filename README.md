@@ -55,3 +55,6 @@ Response returns:
 Include:
 - `x-api-key: <DefaultApiKeyValue>`
 - `Authorization: Bearer <token>`
+
+## License
+Proprietary — ValueLayer 2026. All rights reserved.
